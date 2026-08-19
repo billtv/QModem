@@ -445,7 +445,7 @@ get_platform_suggest_pdp_index()
     fibocom)
         case $platform in
             mediatek)
-                echo 3
+                echo 1
                 ;;
             *)
                 echo 1
@@ -478,6 +478,13 @@ update_config()
     config_get suggest_pdp_index $modem_config suggest_pdp_index
     [ -z "$suggest_pdp_index" ] && suggest_pdp_index=$(get_platform_suggest_pdp_index)
     [ -z "$pdp_index" ] && pdp_index=$suggest_pdp_index
+    # USB FM350/RW350: CID 0 is not a usable CGPADDR/RNDIS context. QModem
+    # 2026.2.27 stored suggest_pdp_index=0; Windows and the working RNDIS
+    # path both use CID 1. Remap 0 so existing configs keep working.
+    if [ "$manufacturer" = "fibocom" ] && [ "$platform" = "mediatek" ] && [ "$pdp_index" = "0" ]; then
+        m_debug "fm350/rw350 pdp_index 0 is not usable for RNDIS CGPADDR, using 1"
+        pdp_index=1
+    fi
     config_get ra_master $modem_config ra_master
     config_get extend_prefix $modem_config extend_prefix
     config_get en_bridge $modem_config en_bridge
@@ -504,6 +511,9 @@ update_config()
         donot_nat=1
     fi
     driver=$(get_driver)
+    if [ "$manufacturer" = "fibocom" ] && [ "$platform" = "mediatek" ]; then
+        fm350_pick_at_port
+    fi
     update_sim_slot
     case $sim_slot in
         1)
@@ -590,7 +600,7 @@ check_dial_prepare()
         config_fullfill=1
     fi
     if [ "$config_fullfill" = "1" ] && [ "$sim_fullfill" = "1" ] && [ "$netdev_fullfill" = "1" ] ;then
-        cmd_dial_cfun_enable "$at_port"
+        check_cfun
         return 1
     else
         return 0
@@ -628,9 +638,25 @@ check_ip()
             ipaddr=$(cmd_dial_command "$at_port" "$check_ip_command" | grep +CGPADDR:)
         fi
 
-        if [ -n "$ipaddr" ];then
+        if [ -z "$ipaddr" ]; then
+            # LuCI/rpcd and the dialer share one AT port. A lock timeout is
+            # not a lost PDP; keep the address already on the RNDIS iface.
+            local iface_ip
+            iface_ip=$(ip -4 -o addr show "$modem_netcard" 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -n1)
+            if [ -n "$iface_ip" ]; then
+                ipv4="$iface_ip"
+                connection_status=1
+                m_debug "CGPADDR empty, keep iface IP $ipv4"
+            else
+                connection_status="-1"
+                m_debug "at port response unexpected $ipaddr"
+            fi
+        elif [ -n "$ipaddr" ];then
             ipv6=$(echo $ipaddr | grep -oE "\b([0-9a-fA-F]{0,4}:){2,7}[0-9a-fA-F]{0,4}\b")
-            ipv4=$(echo $ipaddr | grep -oE "\b([0-9]{1,3}\.){3}[0-9]{1,3}\b")
+            # FM350 quotes IPv4 then a dotted IPv6. A naive IPv4 regex treats
+            # the IPv6 fragments as extra addresses (issue 179 CID 1 "0.0.0.0").
+            ipv4=$(echo "$ipaddr" | grep -oE '"[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+"' | tr -d '"' | grep -v '^0\.0\.0\.0$' | head -n 1)
+            [ -z "$ipv4" ] && ipv4=$(echo "$ipaddr" | grep -oE "\b([0-9]{1,3}\.){3}[0-9]{1,3}\b" | grep -v '^0\.0\.0\.0$' | head -n 1)
             if [ "$manufacturer" = "simcom" ];then
                 ipv4=$(echo $ipaddr | grep -oE "\b([0-9]{1,3}\.){3}[0-9]{1,3}\b" | grep -v "0\.0\.0\.0" | head -n 1)
                 ipv6=$(echo $ipaddr | grep -oE "\b([0-9a-fA-F]{0,4}.){2,7}[0-9a-fA-F]{0,4}\b")
@@ -1177,12 +1203,153 @@ qmi_dial()
     done
 }
 
+fm350_parse_reg_stat()
+{
+    local line="$1"
+    local fields n stat
+
+    line=$(echo "$line" | tr -d '\r' | grep -E '\+(CEREG|C5GREG):' | head -n1)
+    [ -z "$line" ] && { echo ""; return; }
+    fields=${line#*:}
+    n=$(echo "$fields" | cut -d',' -f1 | tr -d ' ')
+    stat=$(echo "$fields" | cut -d',' -f2 | tr -d ' ')
+    [ -z "$stat" ] && stat="$n"
+    echo "$stat"
+}
+
+fm350_cops_registered()
+{
+    echo "$1" | tr -d '\r' | grep -qE '\+COPS:[[:space:]]*0,[0-9]+,"[^"]+",[0-9]+'
+}
+
+fm350_registration_state()
+{
+    local cereg_raw c5greg_raw cops_raw
+    local cereg_stat c5greg_stat
+
+    cereg_raw=$(cmd_dial_cereg_query "$at_port")
+    c5greg_raw=$(cmd_dial_c5greg_query "$at_port")
+    cops_raw=$(cmd_dial_cops_query "$at_port")
+    cereg_stat=$(fm350_parse_reg_stat "$cereg_raw")
+    c5greg_stat=$(fm350_parse_reg_stat "$c5greg_raw")
+
+    if [ "$cereg_stat" = "1" ] || [ "$cereg_stat" = "5" ] || \
+       [ "$c5greg_stat" = "1" ] || [ "$c5greg_stat" = "5" ] || \
+       fm350_cops_registered "$cops_raw"; then
+        echo "registered"
+        return 0
+    fi
+    if [ "$cereg_stat" = "3" ] || [ "$c5greg_stat" = "3" ]; then
+        echo "denied"
+        return 1
+    fi
+    echo "searching"
+    return 2
+}
+
+fm350_pick_at_port()
+{
+    local p base ifnum
+    local ports="$at_port"
+
+    config_get ports "$modem_config" valid_at_ports "$at_port"
+    for p in $ports $at_port; do
+        [ -e "$p" ] || continue
+        base=$(basename "$p")
+        ifnum=$(cat /sys/class/tty/$base/device/../bInterfaceNumber 2>/dev/null)
+        if [ "$ifnum" = "06" ] || [ "$ifnum" = "6" ]; then
+            if [ "$at_port" != "$p" ]; then
+                m_debug "fm350 prefer USB IF 6 AT port $p (was $at_port)"
+                at_port="$p"
+            fi
+            return
+        fi
+    done
+}
+
+fm350_ensure_nr_rat()
+{
+    local raw first
+    # Only repair a RAT mode that cannot camp on NR. Leave 14/16/17/20 alone
+    # so a user-set GTACT is not overwritten.
+    raw=$(cmd_dial_gtact_query "$at_port")
+    first=$(echo "$raw" | tr -d '\r' | grep "+GTACT:" | head -n1 | sed 's/+GTACT:[ ]*//' | cut -d',' -f1 | tr -d ' ')
+    case "$first" in
+        10|14|16|17|20)
+            return 0
+            ;;
+    esac
+    m_debug "GTACT=$first has no NR, apply NR+LTE NR-first (AT+GTACT=17,6,3,0)"
+    cmd_dial_gtact_set "$at_port" "17,6,3,0" >/dev/null
+    sleep 3
+}
+
+fm350_wait_registration()
+{
+    local tries=0
+    local state
+
+    # Keep AT+COPS=0,0 so a COPS:0,255 modem continues searching. Only
+    # suppress PDP activation until CEREG/C5GREG/COPS reports a network.
+    while [ $tries -lt 12 ]; do
+        state=$(fm350_registration_state)
+        case "$state" in
+            registered)
+                m_debug "fm350 registered"
+                return 0
+                ;;
+            denied)
+                m_debug "fm350 registration denied, skip CGACT and retry later"
+                return 1
+                ;;
+            *)
+                m_debug "fm350 not registered ($state), wait without occupying AT port"
+                sleep 10
+                ;;
+        esac
+        tries=$((tries+1))
+    done
+    m_debug "fm350 still not registered after wait"
+    return 1
+}
+
+fm350_activate_rndis()
+{
+    local res
+
+    cmd_dial_cgatt_attach "$at_port" >/dev/null
+    res=$(cmd_dial_command "$at_port" "AT+CGACT=1,$pdp_index")
+    if echo "$res" | grep -q "ME PDN ACT"; then
+        m_debug "fm350 RNDIS PDN activated"
+        return 0
+    fi
+    if echo "$res" | grep -q "OK" && ! echo "$res" | grep -q "ERROR"; then
+        return 0
+    fi
+
+    # Auto-activated default PDN can report an IP while RNDIS is still
+    # unbound. Recycle attach once so CGACT emits +CGEV: ME PDN ACT.
+    m_debug "fm350 CGACT=1,$pdp_index did not bind RNDIS, recycle attach once"
+    cmd_dial_cgatt_detach "$at_port" >/dev/null
+    cmd_dial_cops_deregister "$at_port" >/dev/null
+    sleep 2
+    cmd_dial_cops_auto "$at_port" >/dev/null
+    fm350_wait_registration || return 1
+    cmd_dial_cgatt_attach "$at_port" >/dev/null
+    res=$(cmd_dial_command "$at_port" "AT+CGACT=1,$pdp_index")
+    if echo "$res" | grep -q "ERROR"; then
+        m_debug "fm350 CGACT still failed after recycle"
+        return 1
+    fi
+    return 0
+}
+
 at_dial()
 {
     if [ -z "$pdp_type" ];then
         pdp_type="IP"
     fi
-    [ -n "$apn" ] && apn_append=",\"$apn\"" || apn_append=""
+    [ -n "$apn" ] && [ "$apn" != "auto" ] && apn_append=",\"$apn\"" || apn_append=""
     local at_command='AT+COPS=0,0'
     tmp=$(cmd_dial_command "${at_port}" "${at_command}")
     pdp_type=$(echo $pdp_type | tr 'a-z' 'A-Z')
@@ -1227,16 +1394,19 @@ at_dial()
                     fi
                     ;;
                 "mediatek")
-                    # delay=3
-                    # [ "$apn" = "auto" ] || [ -z "$apn" ] && apn="cbnet"
                     if [ "$pdp_index" = "3" ];then
                         delay=3
                         [ "$apn" = "auto" ] || [ -z "$apn" ] && apn="cbnet"
-                        m_debug "Due to a historical issue (https://github.com/FUjr/QModem/issues/179#issuecomment-3968653343), the fm350 pdp_index was incorrectly set to 3, which caused dialing to work but remain unstable. In version 2026.2.27, we have fixed this issue."
-                        m_debug "To avoid unexpectedly removing legacy configuration files, we applied additional handling to ensure consistent behavior with previous versions. However, if you see this message, please manually set the pdp_index to 0. We apologize for any inconvenience caused."
+                        m_debug "Legacy fm350 pdp_index=3 is still accepted. USB RNDIS on FM350/RW350 uses CID 1 (Windows fibocom-connect and AT+CGPADDR). Do not set pdp_index to 0: AT+CGPADDR=0 returns ERROR and never binds RNDIS."
                     fi
                     at_command="AT+CGACT=1,$pdp_index"
-                    cgdcont_command="AT+CGDCONT=$pdp_index,\"$pdp_type\",\"$apn\""
+                    # Never write an empty APN: that wipes the operator-provisioned
+                    # CMNET/cmiot5g context. Skip the APN field when unset/auto.
+                    if [ -n "$apn" ] && [ "$apn" != "auto" ]; then
+                        cgdcont_command="AT+CGDCONT=$pdp_index,\"$pdp_type\",\"$apn\""
+                    else
+                        cgdcont_command="AT+CGDCONT=$pdp_index,\"$pdp_type\""
+                    fi
                     ;;
                 "lte")
                     at_command="AT+GTRNDIS=1,$pdp_index"
@@ -1365,10 +1535,23 @@ at_dial()
         	umbim -d $mbim_port connect 0 --apn $apn
 		 	;;
 		*)
-			cmd_dial_command "${at_port}" "${cgdcont_command}"
-            [ -n "$ppp_auth_command" ] && cmd_dial_command "${at_port}" "$ppp_auth_command"
-            [ -n "$nat_cfg" ] && cmd_dial_command "${at_port}" "$nat_cfg"
-			cmd_dial_command "${at_port}" "$at_command"
+            if [ "$manufacturer" = "fibocom" ] && [ "$platform" = "mediatek" ]; then
+                fm350_pick_at_port
+                check_cfun
+                fm350_ensure_nr_rat
+                if ! fm350_wait_registration; then
+                    m_debug "fm350 skip CGACT until registered"
+                    return
+                fi
+                [ -n "$cgdcont_command" ] && cmd_dial_command "${at_port}" "${cgdcont_command}"
+                [ -n "$ppp_auth_command" ] && cmd_dial_command "${at_port}" "$ppp_auth_command"
+                fm350_activate_rndis
+            else
+                cmd_dial_command "${at_port}" "${cgdcont_command}"
+                [ -n "$ppp_auth_command" ] && cmd_dial_command "${at_port}" "$ppp_auth_command"
+                [ -n "$nat_cfg" ] && cmd_dial_command "${at_port}" "$nat_cfg"
+                cmd_dial_command "${at_port}" "$at_command"
+            fi
 		 	;;
 	esac
 }
@@ -1512,7 +1695,8 @@ ip_change_fm350()
     else
         at_command="AT+CGPADDR=$pdp_index"
         response=$(cmd_dial_cgpaddr "$at_port" "$pdp_index")
-        ipv4_config=$(echo "$response" | grep "+CGPADDR:" | grep -o '"[0-9]\+\.[0-9]\+\.[0-9]\+\.[0-9]\+"' | head -1 | tr -d '"')
+        ipv4_config=$(echo "$response" | grep "+CGPADDR:" | grep -o '"[0-9]\+\.[0-9]\+\.[0-9]\+\.[0-9]\+"' | tr -d '"' | grep -v '^0\.0\.0\.0$' | head -1)
+        [ -z "$ipv4_config" ] && return
         gateway="${ipv4_config%.*}.1"
 
         response=$(cmd_dial_gtdns "$at_port" "$pdp_index")
@@ -1532,7 +1716,16 @@ ip_change_fm350()
     uci add_list network.${interface_name}.dns="${ipv4_dns1}"
     uci add_list network.${interface_name}.dns="${ipv4_dns2}"
     uci commit network
-    ifdown ${interface_name}
+    # ifdown tears down RNDIS and leaves RX=0. ifup alone lets netifd
+    # publish the static address/DNS into resolv.conf.auto for dnsmasq.
+    if [ -n "$modem_netcard" ] && [ -d "/sys/class/net/$modem_netcard" ]; then
+        ip addr replace "${ipv4_config}/24" dev "$modem_netcard"
+        ip link set "$modem_netcard" up
+        if [ -n "$gateway" ]; then
+            ip route replace default via "$gateway" dev "$modem_netcard" metric "${metric:-6}" 2>/dev/null || \
+                ip route replace default via "$gateway" metric "${metric:-6}"
+        fi
+    fi
     ifup ${interface_name}
     m_debug "set interface $interface_name to $ipv4_config"
 
@@ -1632,18 +1825,46 @@ handle_ip_change()
     esac
 }
 
+cfun_mode_from_response()
+{
+    echo "$1" | tr -d '\r' | grep "+CFUN:" | head -n1 | sed 's/+CFUN:[ ]*//' | cut -d',' -f1 | tr -d ' '
+}
+
 check_cfun(){
-    at_command="AT+CFUN?"
-    response=$(cmd_dial_command "$at_port" "${at_command}")
-    cfun_status=$(echo "$response" | tr -d "\r" | grep "+CFUN:" | awk '{print $2}')
-    cfun_status=$(echo "$cfun_status" | cut -d',' -f1)
-    if [ "$cfun_status" = "1" ]; then
-        return 0
-    else
-        at_command="AT+CFUN=1"
-        response=$(cmd_dial_command "$at_port" "${at_command}")
-        return 1
+    local response mode
+    response=$(cmd_dial_cfun_query "$at_port")
+    mode=$(cfun_mode_from_response "$response")
+    case "$mode" in
+        1)
+            m_debug "CFUN=$mode (online)"
+            return 0
+            ;;
+        0)
+            m_debug "CFUN=$mode (minimum/offline), sending AT+CFUN=1"
+            ;;
+        4)
+            m_debug "CFUN=$mode (flight/offline), sending AT+CFUN=1"
+            ;;
+        "")
+            m_debug "CFUN query empty, sending AT+CFUN=1"
+            ;;
+        *)
+            m_debug "CFUN=$mode (not online), sending AT+CFUN=1"
+            ;;
+    esac
+    cmd_dial_cfun_enable "$at_port" >/dev/null
+    # Leaving CFUN=0/4 needs RF settle time before COPS/CGACT.
+    if [ "$mode" = "0" ] || [ "$mode" = "4" ] || [ -z "$mode" ]; then
+        sleep 5
     fi
+    response=$(cmd_dial_cfun_query "$at_port")
+    mode=$(cfun_mode_from_response "$response")
+    if [ "$mode" = "1" ]; then
+        m_debug "CFUN is 1 after enable"
+        return 0
+    fi
+    m_debug "CFUN still $mode after AT+CFUN=1"
+    return 1
 }
 
 check_logfile_line()
@@ -1687,12 +1908,31 @@ at_dial_monitor()
         check_ip
         case $connection_status in
             0)
+                if [ "$manufacturer" = "fibocom" ] && [ "$platform" = "mediatek" ]; then
+                    state=$(fm350_registration_state)
+                    if [ "$state" != "registered" ]; then
+                        m_debug "fm350 not registered ($state), skip CGACT"
+                        sleep 15
+                        check_logfile_line
+                        continue
+                    fi
+                fi
                 at_dial
                 sleep 3
                 ;;
             -1)
                 unexpected_response_count=$((unexpected_response_count+1))
                 if [ $unexpected_response_count -gt 3 ]; then
+                    if [ "$manufacturer" = "fibocom" ] && [ "$platform" = "mediatek" ]; then
+                        state=$(fm350_registration_state)
+                        if [ "$state" != "registered" ]; then
+                            m_debug "fm350 unexpected AT while not registered ($state), skip CGACT"
+                            unexpected_response_count=0
+                            sleep 15
+                            check_logfile_line
+                            continue
+                        fi
+                    fi
                     at_dial
                     unexpected_response_count=0
                 fi
@@ -1731,6 +1971,15 @@ case "$2" in
                 debug_subject="modem_hang"
                 hang;;
             *)
+                dial_lock="${MODEM_RUNDIR}/${modem_config}_dir/dial.lock"
+                # flock is released when this process exits; OpenWrt lock(1)
+                # can stay held after killall and block the next dialer.
+                touch "$dial_lock"
+                exec 9>"$dial_lock"
+                if ! flock -n 9; then
+                    m_debug "dial already running for $modem_config"
+                    exit 0
+                fi
                 dial;;
         esac
 esac

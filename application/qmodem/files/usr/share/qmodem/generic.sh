@@ -570,13 +570,13 @@ get_connect_status()
     else
         expect="+CGACT:"
         result=`cmd_cgact_query "$at_port" | grep $expect|tr '\r' '\n'`
-        # for fm350 pdp_index 0, GGACT will return empty,so we need to add it manually
+        # FM350/RW350 AT+CGACT? often returns empty even when a PDP is up.
         if [ -z "$result" ]; then
             case $vendor in
                 "fibocom")
                     case $platform in
                         "mediatek")
-                            result="+CGACT: 0,1"
+                            result="+CGACT: ${pdp_index:-1},1"
                             ;;
                     esac
                     ;;
@@ -588,12 +588,8 @@ get_connect_status()
             result=$(cmd_cgpaddr "$at_port" "$pdp_index" | grep $expect)
             if [ -n "$result" ];then
                 ipv6=$(echo $result | grep -oE "\b([0-9a-fA-F]{0,4}:){2,7}[0-9a-fA-F]{0,4}\b")
-                ipv4=$(echo $result | grep -oE "\b([0-9]{1,3}\.){3}[0-9]{1,3}\b")
-                disallow_ipv4="0.0.0.0"
-                #remove the disallow ip
-                if [ "$ipv4" == "$disallow_ipv4" ];then
-                    ipv4=""
-                fi
+                ipv4=$(echo "$result" | grep -oE '"[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+"' | tr -d '"' | grep -v '^0\.0\.0\.0$' | head -n 1)
+                [ -z "$ipv4" ] && ipv4=$(echo $result | grep -oE "\b([0-9]{1,3}\.){3}[0-9]{1,3}\b" | grep -v '^0\.0\.0\.0$' | head -n 1)
             fi
             if [ -n "$ipv4" ] || [ -n "$ipv6" ];then
                 connect_status="Yes"

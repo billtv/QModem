@@ -67,6 +67,11 @@ redial()
     dial $1
 }
 
+_modem_dial_running()
+{
+    ps w | grep -v grep | grep -q "modem_dial.sh $1 dial"
+}
+
 _update_modem()
 {
     local target
@@ -78,15 +83,23 @@ _update_modem()
     fi
     data=$(_procd_ubus_call list | jq -r  ".$service.instances.modem_$1")
     [ "$data" == "null" ] && current_status=0 || current_status=1
+    [ "$current_status" = "0" ] && _modem_dial_running "$1" && current_status=1
     logger -t qmodem_network "cfg:$1 current:$current_status;target:$target "
     if [ "$current_status" != "$target" ];then
-        [ "$target" -eq 1 ] && dial $1 || hang $1
+        # Call _dial directly. extra_command dial uses rc_procd, which
+        # nests inside start_service and becomes `ubus call service set { }`
+        # so the instance is not tracked and the monitor exits after boot.
+        [ "$target" -eq 1 ] && _dial $1 || hang $1
         logger -t qmodem_network "update modem cfg: $1 dial:$target"
     fi
 }
 
 _dial()
 {
+    if _modem_dial_running "$1"; then
+        logger -t qmodem_network "Modem $1 dial already running, skip duplicate start"
+        return
+    fi
     procd_open_instance "modem_$1"
     procd_set_param command "/usr/share/qmodem/modem_dial.sh" "$1" dial
     procd_set_param respawn 120 15 10

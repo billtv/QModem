@@ -406,13 +406,13 @@
                 "Set Current SIM to Slot 2 > AT+GTDUALSIM=1": "AT+GTDUALSIM=1"
             },
             {
-                "Manual Set Access Point > AT+CGDCONT=3,\"IPV4V6\",\"APN\"": "AT+CGDCONT=3,\"IPV4V6\",\"Set APN here\""
+                "Manual Set Access Point > AT+CGDCONT=1,\"IPV4V6\",\"APN\"": "AT+CGDCONT=1,\"IPV4V6\",\"Set APN here\""
             },
             {
-                "Manual Dial > AT+CGACT=1,3": "AT+CGACT=1,3"
+                "Manual Dial > AT+CGACT=1,1": "AT+CGACT=1,1"
             },
             {
-                "Stop Dialing > AT+CGACT=0,3": "AT+CGACT=0,3"
+                "Stop Dialing > AT+CGACT=0,1": "AT+CGACT=0,1"
             },
             {
                 "Query Current Port Mode > AT+GTUSBMODE?": "AT+GTUSBMODE?"
